@@ -503,17 +503,6 @@ func (ch *Channel) Connect(ctx context.Context, hostPort string) (*Connection, e
 		return nil, err
 	}
 
-	// Any connections added after the channel is in StartClose should also be set to start close.
-	if chState := ch.State(); chState == ChannelStartClose {
-		// TODO(prashant): If Connect is called, but no outgoing calls are made, then this connection
-		// will block Close, as it will never get cleaned up.
-		c.withStateLock(func() error {
-			c.state = connectionStartClose
-			return nil
-		})
-		c.log.Debugf("Channel is in start close, set connection to start close")
-	}
-
 	return c, err
 }
 
@@ -534,8 +523,50 @@ func (ch *Channel) updatePeer(p *Peer) {
 	p.callOnUpdateComplete()
 }
 
+// addConnection adds the connection to the channel's list of connection
+// if the channel is in a valid state to accept this connection. It returns
+// whether the connection was added, and whether the connection should be
+// set to the startClose state.
+func (ch *Channel) addConnection(c *Connection, direction connectionDirection) (added, setStartClose bool) {
+	ch.mutable.Lock()
+	defer ch.mutable.Unlock()
+
+	switch state := ch.mutable.state; state {
+	case ChannelStartClose:
+		// Outbound connections are allowed in ChannelStartClose, but the
+		// connection state should be set to connectionStartClose.
+		if direction != outbound {
+			return false, false
+		}
+		setStartClose = true
+	case ChannelClient, ChannelListening:
+	default:
+		return false, false
+	}
+
+	ch.mutable.conns[c.connID] = c
+	return true, setStartClose
+}
+
 func (ch *Channel) connectionActive(c *Connection, direction connectionDirection) {
-	c.log.Debugf("Add %v connection as an active peer for %v", direction, c.remotePeerInfo.HostPort)
+	c.log.Debugf("New active %v connection for peer %v", direction, c.remotePeerInfo.HostPort)
+
+	added, setStartClose := ch.addConnection(c, direction)
+	if !added {
+		// The channel isn't in a valid state to accept this connection, close the connection.
+		c.log.Debugf("Closing connection due to closing channel state")
+		c.Close()
+		return
+	}
+	if setStartClose {
+		// TODO(prashant): If Connect is called, but no outgoing calls are made, then this connection
+		// will block Close, as it will never get cleaned up.
+		c.withStateLock(func() error {
+			c.state = connectionStartClose
+			return nil
+		})
+		c.log.Debugf("Channel is in start close, set connection to start close")
+	}
 
 	p := ch.rootPeers().GetOrAdd(c.remotePeerInfo.HostPort)
 	if err := p.addConnection(c, direction); err != nil {
@@ -546,10 +577,6 @@ func (ch *Channel) connectionActive(c *Connection, direction connectionDirection
 	}
 
 	ch.updatePeer(p)
-
-	ch.mutable.Lock()
-	ch.mutable.conns[c.connID] = c
-	ch.mutable.Unlock()
 }
 
 func (ch *Channel) inboundConnectionActive(c *Connection) {
